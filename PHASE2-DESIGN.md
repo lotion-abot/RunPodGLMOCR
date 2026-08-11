@@ -407,6 +407,44 @@ Phase 2 要按序试这三个,**每个都量启动时间和吞吐**,不预设结
 
 ---
 
+## 8b. 镜像怎么构建 —— 走 GHCR,不走 RunPod GitHub 集成
+
+两条路都能用,我们选第二条:
+
+| | RunPod GitHub 集成 | **CI → GHCR(现行)** |
+|---|---|---|
+| 谁构建 | RunPod | GitHub Actions |
+| 需要什么权限 | **把 GitHub 连到 RunPod = owner 级操作** | 只要在建端点时填一个镜像 URL |
+| 镜像存哪 | RunPod 自有 registry | GHCR **私有** package |
+| 版本可控性 | 跟分支走 | **按 commit SHA 打标签**,端点钉死某个 SHA |
+
+选 GHCR 的两个理由:
+1. **Lotion 在 organization 里不是 owner**,连 GitHub 到 RunPod 这一步大概率做不了
+2. 镜像里烘了 `selftest_page.png`,那是**真实客户审计页**,镜像**必须私有**。
+   GHCR 私有 package 免费,而且用内置 `GITHUB_TOKEN` 认证,不用额外管密钥
+
+实现:`.github/workflows/build.yml`。push 到 main 且动了 Dockerfile/handler/start.sh/
+runner.py/selftest_page.png 时自动构建,推两个 tag:`:latest` 和 `:<commit-sha>`。
+
+> **端点要钉 SHA tag,不要钉 `:latest`。**「现在到底跑的是哪个镜像」不能靠猜 ——
+> 这正是 Replicate 那边 deployment 停在旧版本、白跑三次 warm6 的原因。
+
+### ⚠️ 私有 GHCR 需要在 RunPod 配 registry 凭证
+
+RunPod 拉不了私有 ghcr.io 镜像,除非先配好凭证:
+
+**Settings → Registry Credentials → 新建一条**
+- Registry: `ghcr.io`
+- Username: 你的 GitHub 用户名(`lotion-abot`)
+- Password: 一个 GitHub **PAT**,勾选 `read:packages` 权限
+
+建端点时在 Container Image 填 `ghcr.io/lotion-abot/runpodglmocr:<sha>`(**小写**,GHCR 不收大写),
+并选上这条凭证。
+
+> 粘贴时别带空格 —— 这是这一步最常见的失败原因。
+
+---
+
 ## 9. 文件清单与构建顺序
 
 ```
