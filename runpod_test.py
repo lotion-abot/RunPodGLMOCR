@@ -1,28 +1,31 @@
 """
-GLM-OCR self-hosted test bench — LADDER + STRESS in one file.
+GLM-OCR test bench — LADDER + STRESS + COLDSTART, two transports, one file.
 
     python runpod_test.py          (edit the CONFIG block; no argv, by design)
 
-WHY ONE FILE
-    The Replicate side had ladder_test.py and stress_test.py sharing ~90% of their
-    code and both wrapped around Replicate's prediction API. Self-hosted glmocr is a
-    plain HTTP endpoint, so the API plumbing is gone and the two tests are just two
-    drivers over the same call.
+TRANSPORTS
+    direct      POST straight to a glmocr server (the dev pod, or an SSH tunnel).
+                Measures the GPU with no platform in the way.
+    serverless  POST /v2/{id}/run and poll /status. Measures what production sees,
+                including queue time and cold boots.
 
-WHAT THE LADDER IS ACTUALLY FOR NOW
-    Empty md_results is NOT a random glitch — it is the signature of the layout
-    stage hitting CUDA OOM and SILENTLY SKIPPING THE BATCH while still answering
-    HTTP 200 (proven on the pod: "Layout detection failed for pages [0], skipping
-    batch: CUDA out of memory"). So the level at which the first empty appears IS
-    the OOM cliff, and this ladder is the tool for tuning --gpu-memory-utilization.
-    Green all the way up = your VRAM budget has headroom.
+MODES
+    ladder      climb concurrency until the first EMPTY result. Empty markdown is NOT
+                a random glitch — it is the signature of the layout stage hitting CUDA
+                OOM and SILENTLY SKIPPING THE BATCH while still answering HTTP 200
+                (proven on the pod: "Layout detection failed for pages [0], skipping
+                batch: CUDA out of memory"). So the level where the first empty appears
+                IS the OOM cliff, and this is the tool for calibrating MAX_CONCURRENCY.
+    stress      sustained burst at fixed concurrency; p50/p95 latency.
+    coldstart   THE FLASHBOOT QUESTION. Fire a call, wait past the idle timeout so the
+                worker scales down, fire again — repeat. RunPod's delayTime shows what
+                the revive actually cost. FlashBoot is a CRIU-style process snapshot,
+                so in principle it restores vLLM *after* its 301s compile warm-up; but
+                there is a known "very slow cold starts even with flashboot" report
+                against vLLM workers specifically. Measure, never assume.
 
-TRANSPORTS — set ENDPOINTS to whichever you are measuring:
-    on the pod          ["http://localhost:5002"]                        pure GPU throughput
-    from Windows        ["http://localhost:5002"]  + an SSH tunnel:      GPU + MY->RO network
-        ssh -N -L 5002:localhost:5002 -p 11053 -i $env:USERPROFILE\\.ssh\\id_ed25519 root@<POD_IP>
-    RunPod HTTP proxy   ["https://<podid>-5002.proxy.runpod.net"]        needs the port exposed
-    several backends    [...5002, ...5003]                               round-robined
+SSH tunnel for `direct` from Windows:
+    ssh -N -L 5002:localhost:5002 -p <PORT> -i $env:USERPROFILE\\.ssh\\id_ed25519 root@<POD_IP>
 """
 import base64
 import glob
@@ -37,31 +40,41 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 # ======================= CONFIG (edit here) =======================
+# serverless: set both. direct: leave ENDPOINT_ID empty and set ENDPOINTS.
+ENDPOINT_ID = os.environ.get("RUNPOD_ENDPOINT_ID", "")
+API_KEY = os.environ.get("RUNPOD_API_KEY", "")
+
 ENDPOINTS = os.environ.get("ENDPOINTS", "http://localhost:5002").split(",")
 
 IMAGE_DIR = os.environ.get(
     "IMAGE_DIR",
     r"\\ABOT-TEST-03\MBRSUploadTraining\YE2026\3C876CBE-23C6-4DA5-B082-23483B4063BA\SplitImage")
 
-MODE = os.environ.get("MODE", "both")        # ladder | stress | both
+MODE = os.environ.get("MODE", "ladder")      # ladder | stress | coldstart | all
 
-LADDER_LEVELS = [1, 2, 3, 4, 6, 8, 12]       # simultaneous calls per round
-LADDER_STOP_ON_EMPTY = True                  # first empty = the OOM cliff -> stop
+LADDER_LEVELS = [1, 2, 3, 4, 6, 8, 12]
+LADDER_STOP_ON_EMPTY = True
 PAUSE_BETWEEN_LEVELS = 3
 
-STRESS_TOTAL = int(os.environ.get("STRESS_TOTAL", "30"))   # production-shaped run
-STRESS_CONC = int(os.environ.get("STRESS_CONC", "6"))      # in-flight cap
+STRESS_TOTAL = int(os.environ.get("STRESS_TOTAL", "30"))
+STRESS_CONC = int(os.environ.get("STRESS_CONC", "6"))
 
-TIMEOUT = 180
-RETRIES = 2          # connection resets / 5xx only. Self-hosted has no 429.
+# Gaps (seconds) between coldstart probes. Each must EXCEED the endpoint's idle timeout
+# or the worker never scales down and the probe measures nothing.
+COLDSTART_GAPS = [int(g) for g in os.environ.get("COLDSTART_GAPS", "700,700,700").split(",")]
+
+TIMEOUT = 900
+RETRIES = 2
+POLL_S = 2.0
 # ==================================================================
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+SERVERLESS = bool(ENDPOINT_ID)
+RP = "https://api.runpod.ai/v2"
 
 
 # ------------------------------------------------------------------ helpers
 def png_size(path):
-    """(width, height) from the PNG IHDR — no Pillow dependency."""
     with open(path, "rb") as f:
         head = f.read(24)
     if head[:8] != b"\x89PNG\r\n\x1a\n":
@@ -88,75 +101,108 @@ def pct(vals, p):
     if not vals:
         return None
     s = sorted(vals)
-    k = min(len(s) - 1, int(round(p / 100.0 * (len(s) - 1))))
-    return s[k]
+    return s[min(len(s) - 1, int(round(p / 100.0 * (len(s) - 1))))]
+
+
+# ------------------------------------------------------------------ transports
+def _call_direct(endpoint, uri):
+    r = requests.post(endpoint.rstrip("/") + "/glmocr/parse",
+                      json={"images": [uri]}, timeout=TIMEOUT)
+    if r.status_code != 200:
+        return None, "HTTP %d: %s" % (r.status_code, r.text[:160]), {}
+    return r.json(), "", {}
+
+
+def _call_serverless(_endpoint, uri):
+    """POST /run then poll /status. /runsync is unusable: its result window is 1 min
+    (5 max) and a cold boot is 6-7 min."""
+    hdr = {"Authorization": "Bearer " + API_KEY, "Content-Type": "application/json"}
+    r = requests.post("%s/%s/run" % (RP, ENDPOINT_ID), headers=hdr,
+                      json={"input": {"image": uri}}, timeout=120)
+    if r.status_code != 200:
+        return None, "submit HTTP %d: %s" % (r.status_code, r.text[:160]), {}
+    job = r.json()
+    jid = job.get("id")
+    if not jid:
+        return None, "no job id: %s" % str(job)[:160], {}
+
+    deadline = time.time() + TIMEOUT
+    while time.time() < deadline:
+        g = requests.get("%s/%s/status/%s" % (RP, ENDPOINT_ID, jid), headers=hdr, timeout=60)
+        if g.status_code != 200:
+            return None, "status HTTP %d: %s" % (g.status_code, g.text[:160]), {}
+        job = g.json()
+        st = job.get("status")
+        if st in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"):
+            break
+        time.sleep(POLL_S)
+
+    # delayTime = queue + cold boot. This is the number the FlashBoot question lives in.
+    meta = {"delay_ms": job.get("delayTime"), "exec_ms": job.get("executionTime"),
+            "status": job.get("status"), "job_id": jid}
+    if job.get("status") != "COMPLETED":
+        return None, "job %s: %s" % (job.get("status"), str(job.get("error"))[:160]), meta
+    return job.get("output"), "", meta
 
 
 def call(endpoint, path, label):
-    """One page through one endpoint. ok == non-empty markdown, not just HTTP 200."""
+    """One page. ok == non-empty markdown, not merely HTTP 200."""
     uri = as_uri(path)
     t0 = time.perf_counter()
-    err = ""
+    err, meta = "", {}
     for attempt in range(RETRIES + 1):
         try:
-            r = requests.post(endpoint.rstrip("/") + "/glmocr/parse",
-                              json={"images": [uri]}, timeout=TIMEOUT)
-            if r.status_code >= 500:
-                err = "HTTP %d: %s" % (r.status_code, r.text[:120])
-                time.sleep(1.0 * (attempt + 1))
-                continue
-            if r.status_code != 200:
-                return _res(label, path, t0, None, "HTTP %d: %s" % (r.status_code, r.text[:160]), attempt)
-            return _res(label, path, t0, r.json(), "", attempt)
+            body, err, meta = (_call_serverless if SERVERLESS else _call_direct)(endpoint, uri)
+            if not err:
+                return _res(label, path, t0, body, "", attempt, meta)
+            if "submit HTTP 4" in err or "job FAILED" in err:
+                break                                   # not transient
         except Exception as ex:
             err = "%s: %s" % (type(ex).__name__, str(ex)[:120])
-            time.sleep(1.0 * (attempt + 1))
-    return _res(label, path, t0, None, err, RETRIES)
+        time.sleep(1.0 * (attempt + 1))
+    return _res(label, path, t0, None, err, RETRIES, meta)
 
 
-def _res(label, path, t0, body, err, retries):
+def _res(label, path, t0, body, err, retries, meta):
     md = md_of(body)
-    elems = flat_elems(body)
     return {
-        "label": label,
-        "img": os.path.basename(path),
+        "label": label, "img": os.path.basename(path),
         "wall": time.perf_counter() - t0,
-        "md_len": len(md),
-        "tables": md.count("<table"),
-        "elems": len(elems),
+        "md_len": len(md), "tables": md.count("<table"), "elems": len(flat_elems(body)),
         "ok": bool(md.strip()) and not err,
-        "retries": retries,
-        "error": err,
+        "retries": retries, "error": err,
+        "delay_s": (meta.get("delay_ms") or 0) / 1000.0 if meta.get("delay_ms") else None,
+        "exec_s": (meta.get("exec_ms") or 0) / 1000.0 if meta.get("exec_ms") else None,
+        "warning": (body or {}).get("warning") if isinstance(body, dict) else None,
         "_body": body,
     }
 
 
-def show(r):
-    print("  %s %-9s %-14s wall=%5.1fs md=%-5d elems=%-3d tables=%d%s %s" % (
-        "OK  " if r["ok"] else "FAIL", r["label"], r["img"], r["wall"],
-        r["md_len"], r["elems"], r["tables"],
-        (" retry=%d" % r["retries"]) if r["retries"] else "", r["error"]))
+def show(r, prefix=""):
+    extra = ""
+    if r["delay_s"] is not None:
+        extra = " delay=%5.1fs exec=%5.1fs" % (r["delay_s"], r["exec_s"] or 0)
+    print("%s%s %-9s %-14s wall=%6.1fs%s md=%-5d elems=%-3d tables=%d %s" % (
+        prefix, "OK  " if r["ok"] else "FAIL", r["label"], r["img"], r["wall"], extra,
+        r["md_len"], r["elems"], r["tables"], r["error"] or (r["warning"] or "")))
 
 
 def diagnose_empty(n_empty, level):
     print("")
     print("  >>> %d/%d calls returned EMPTY markdown at concurrency %d." % (n_empty, level, level))
-    print("  >>> This is the LAYOUT-STAGE CUDA OOM signature: the batch is skipped and")
-    print("  >>> the server still answers HTTP 200. Confirm on the pod with:")
-    print("  >>>     grep -c 'out of memory' /workspace/logs/glmocr_50*.log")
-    print("  >>> Fix: lower --gpu-memory-utilization (each glmocr process needs ~1.9 GiB")
-    print("  >>> of VRAM on top of whatever vLLM reserves), or run fewer processes.")
+    print("  >>> That is the LAYOUT-STAGE CUDA OOM signature: the batch is skipped and the")
+    print("  >>> server still answers HTTP 200. Lower MAX_CONCURRENCY or")
+    print("  >>> GPU_MEMORY_UTILIZATION — each glmocr process needs ~1.9 GiB on top of")
+    print("  >>> whatever vLLM reserves. On the worker: grep -c 'out of memory' /var/log/glmocr.log")
 
 
 # ------------------------------------------------------------------ contract check
 def contract_check(body, path):
-    """One-off parity check against the Z.ai cloud contract (see PHASE1-RESULTS.md)."""
     print("\n=== CONTRACT CHECK (vs Z.ai layout_parsing) ===")
     if not isinstance(body, dict):
         print("  response is not a JSON object — nothing to check")
         return
-    md = md_of(body)
-    elems = flat_elems(body)
+    md, elems = md_of(body), flat_elems(body)
     print("  md_results        : %d chars, %d table(s)" % (len(md), md.count("<table")))
     print("  layout_details    : %d elements" % len(elems))
     if not elems:
@@ -166,11 +212,7 @@ def contract_check(body, path):
     need = ("bbox_2d", "content", "index", "native_label")
     missing = [k for k in need if k not in elems[0]]
     print("  element fields    : %s" % ("OK" if not missing else "MISSING " + str(missing)))
-
-    vocab = sorted({e.get("native_label") for e in elems if isinstance(e, dict)})
-    print("  native_label      : %s" % vocab)
-    if vocab == ["text"]:
-        print("  !! only 'text' — label_task_mapping lost (config merge failed)")
+    print("  native_label      : %s" % sorted({e.get("native_label") for e in elems if isinstance(e, dict)}))
 
     xs = [c for e in elems if isinstance(e.get("bbox_2d"), list) for c in e["bbox_2d"][0::2]]
     ys = [c for e in elems if isinstance(e.get("bbox_2d"), list) for c in e["bbox_2d"][1::2]]
@@ -179,17 +221,15 @@ def contract_check(body, path):
         mx, my = max(xs), max(ys)
         print("  bbox max x/y      : %d/%d   (page %dx%d)" % (mx, my, iw, ih))
         if max(mx, my) <= 1000 < max(iw, ih):
-            # verified on the pod: 903/1000*3166 = 2859 px vs the Z.ai golden's 2861
-            print("  -> NORMALIZED 0-1000 (self-hosted). The adapter MUST scale:")
-            print("       x_px = round(x * %d / 1000)   y_px = round(y * %d / 1000)" % (iw, ih))
-            print("     Without it ReportStitchOcr's seam, HeaderRecovery and BboxAspect")
-            print("     silently misplace while every field still looks correct.")
+            print("  !! still 0-1000 NORMALIZED. Through the serverless handler this means the")
+            print("     adapter is broken; ReportStitchOcr / HeaderRecovery / BboxAspect would")
+            print("     misplace silently. Expected: x_px = round(x * %d / 1000)." % iw)
         else:
-            print("  -> looks like PIXELS already (cloud-style); no scaling needed")
+            print("  -> PIXELS, as the cloud contract requires")
     if "polygon" in elems[0]:
-        print("  note: 'polygon' present — the adapter drops it (cloud has no such field)")
+        print("  !! 'polygon' leaked through — the adapter should drop it")
     if "height" not in elems[0]:
-        print("  note: per-element height/width absent — cloud has them; adapter fills in")
+        print("  !! per-element height/width missing — the cloud has them")
 
 
 # ------------------------------------------------------------------ ladder
@@ -197,32 +237,25 @@ def run_ladder(images):
     print("\n" + "=" * 74)
     print("LADDER — climbing concurrency until the first EMPTY (= the OOM cliff)")
     print("=" * 74)
-    idx = 0
-    rows = []
+    idx, rows = 0, []
     for k in LADDER_LEVELS:
-        print("\n=== LEVEL %d: %d simultaneous calls ===" % (k, k))
+        print("\n=== LEVEL %d ===" % k)
         batch = []
         for i in range(k):
             batch.append((ENDPOINTS[i % len(ENDPOINTS)], images[idx % len(images)], "L%d-%d" % (k, i + 1)))
             idx += 1
-
-        t0 = time.perf_counter()
-        results = []
+        t0, results = time.perf_counter(), []
         with ThreadPoolExecutor(max_workers=k) as ex:
-            futs = [ex.submit(call, e, p, lb) for e, p, lb in batch]
-            for f in as_completed(futs):
-                r = f.result()
-                results.append(r)
-                show(r)
+            for f in as_completed([ex.submit(call, e, p, lb) for e, p, lb in batch]):
+                r = f.result(); results.append(r); show(r, "  ")
         wall = time.perf_counter() - t0
         bad = [r for r in results if not r["ok"]]
-        # Count only SUCCESSFUL pages. An OOM-skipped call returns empty in ~2s, so
+        # Count only SUCCESSFUL pages: an OOM-skipped call returns empty in ~2s, so
         # counting it would make the level that just broke look like the fastest one.
         thr = (k - len(bad)) / wall
         rows.append((k, wall, thr, len(bad)))
-        print("  LEVEL %d wall: %.1fs   throughput: %.2f pages/s (ok only)   empty/fail: %d/%d"
+        print("  LEVEL %d wall %.1fs  %.2f pages/s (ok only)  empty/fail %d/%d"
               % (k, wall, thr, len(bad), k))
-
         if bad and LADDER_STOP_ON_EMPTY:
             diagnose_empty(len(bad), k)
             break
@@ -236,6 +269,8 @@ def run_ladder(images):
     if clean:
         best = max(clean, key=lambda r: r[2])
         print("  PEAK (clean): %.2f pages/s at N=%d" % (best[2], best[0]))
+        print("  -> set MAX_CONCURRENCY to at most %d (leave a margin below the cliff)"
+              % max(1, best[0]))
         print("  -> a 28-page report ~ %.0fs of GPU time" % (28 / best[2]))
     return rows
 
@@ -243,44 +278,32 @@ def run_ladder(images):
 # ------------------------------------------------------------------ stress
 def run_stress(images):
     print("\n" + "=" * 74)
-    print("STRESS — %d calls at %d in-flight (distinct pages, no cache inflation)"
-          % (STRESS_TOTAL, STRESS_CONC))
+    print("STRESS — %d calls at %d in-flight (distinct pages)" % (STRESS_TOTAL, STRESS_CONC))
     print("=" * 74)
     tasks = [(ENDPOINTS[i % len(ENDPOINTS)], images[i % len(images)], "s%d" % (i + 1))
              for i in range(STRESS_TOTAL)]
-    results = []
-    t0 = time.perf_counter()
+    results, t0 = [], time.perf_counter()
     with ThreadPoolExecutor(max_workers=STRESS_CONC) as ex:
-        futs = [ex.submit(call, e, p, lb) for e, p, lb in tasks]
-        for f in as_completed(futs):
-            r = f.result()
-            results.append(r)
-            print("  [%3d/%d]" % (len(results), STRESS_TOTAL), end="")
-            show(r)
+        for f in as_completed([ex.submit(call, e, p, lb) for e, p, lb in tasks]):
+            r = f.result(); results.append(r)
+            show(r, "  [%3d/%d] " % (len(results), STRESS_TOTAL))
     wall = time.perf_counter() - t0
 
     ok = [r for r in results if r["ok"]]
     bad = [r for r in results if not r["ok"]]
     walls = [r["wall"] for r in ok]
-
     print("\n=== STRESS SUMMARY ===")
-    print("  calls        : %d   ok: %d   FAIL/EMPTY: %d" % (STRESS_TOTAL, len(ok), len(bad)))
-    print("  burst wall   : %.1fs   throughput: %.2f pages/s  (%.0f pages/min)"
+    print("  calls %d   ok %d   FAIL/EMPTY %d" % (STRESS_TOTAL, len(ok), len(bad)))
+    print("  burst wall %.1fs   throughput %.2f pages/s (%.0f pages/min)"
           % (wall, len(ok) / wall, len(ok) / wall * 60))
     if walls:
-        print("  latency  p50 : %.1fs   p95: %.1fs   max: %.1fs   mean: %.1fs"
+        print("  latency p50 %.1fs   p95 %.1fs   max %.1fs   mean %.1fs"
               % (pct(walls, 50), pct(walls, 95), max(walls), statistics.mean(walls)))
-    if ok:
-        print("  md length    : min=%d  median=%d  max=%d"
-              % (min(r["md_len"] for r in ok),
-                 int(statistics.median(r["md_len"] for r in ok)),
-                 max(r["md_len"] for r in ok)))
-    if bad:
-        empties = [r for r in bad if not r["error"]]
-        if empties:
-            diagnose_empty(len(empties), STRESS_CONC)
-        for r in bad[:8]:
-            print("    FAIL %s %s: %s" % (r["label"], r["img"], r["error"] or "EMPTY markdown"))
+    empties = [r for r in bad if not r["error"]]
+    if empties:
+        diagnose_empty(len(empties), STRESS_CONC)
+    for r in bad[:8]:
+        print("    FAIL %s %s: %s" % (r["label"], r["img"], r["error"] or "EMPTY markdown"))
 
     out = os.path.join(HERE, "runpod_stress_results.json")
     with open(out, "w", encoding="utf-8") as f:
@@ -290,25 +313,74 @@ def run_stress(images):
     return results
 
 
+# ------------------------------------------------------------------ coldstart / FlashBoot
+def run_coldstart(images):
+    print("\n" + "=" * 74)
+    print("COLDSTART — does FlashBoot actually revive this worker cheaply?")
+    print("=" * 74)
+    if not SERVERLESS:
+        print("  SKIPPED: only meaningful against a serverless endpoint (set RUNPOD_ENDPOINT_ID)")
+        return []
+    print("  Each gap must EXCEED the endpoint's Idle Timeout, or the worker never scales")
+    print("  down and this measures nothing. Gaps: %s s\n" % COLDSTART_GAPS)
+
+    rows = []
+    r = call(ENDPOINTS[0], images[0], "boot-1")
+    show(r, "  ")
+    rows.append(("boot-1 (first ever)", r))
+    for i, gap in enumerate(COLDSTART_GAPS, start=2):
+        print("  ... sleeping %ds so the worker scales down ..." % gap)
+        time.sleep(gap)
+        r = call(ENDPOINTS[0], images[i % len(images)], "boot-%d" % i)
+        show(r, "  ")
+        rows.append(("boot-%d (after %ds idle)" % (i, gap), r))
+
+    print("\n--- COLDSTART SUMMARY (delay = queue + boot) ---")
+    for name, r in rows:
+        d = "%.1fs" % r["delay_s"] if r["delay_s"] is not None else "n/a"
+        print("  %-26s delay=%8s  exec=%5.1fs  ok=%s"
+              % (name, d, r["exec_s"] or 0, r["ok"]))
+    delays = [r["delay_s"] for _, r in rows[1:] if r["delay_s"] is not None]
+    if delays:
+        worst = max(delays)
+        print("\n  worst revive delay: %.1fs" % worst)
+        if worst < 60:
+            print("  -> FlashBoot IS working. Idle Timeout can drop to ~60s and the endpoint")
+            print("     can sit at zero between bursts — cheapest possible configuration.")
+        elif worst < 180:
+            print("  -> FlashBoot helps but is not free. Keep Idle Timeout around 600s.")
+        else:
+            print("  -> FlashBoot is NOT saving us (a full boot is ~400s). Options: raise Idle")
+            print("     Timeout to cover the workday, or revive warm_schedule.py with an")
+            print("     endpoint-write API key. Do NOT ship a 6-minute first-page wait.")
+    return rows
+
+
 # ------------------------------------------------------------------ main
 if __name__ == "__main__":
+    if SERVERLESS and not API_KEY:
+        sys.exit("RUNPOD_ENDPOINT_ID is set but RUNPOD_API_KEY is not")
     images = sorted(glob.glob(os.path.join(IMAGE_DIR, "Page_*.png")))
     if not images:
         sys.exit("no Page_*.png found in %s" % IMAGE_DIR)
-    print("endpoints : %s" % ENDPOINTS)
+
+    print("transport : %s" % ("serverless " + ENDPOINT_ID if SERVERLESS else "direct " + str(ENDPOINTS)))
     print("corpus    : %d pages from %s" % (len(images), IMAGE_DIR))
     print("mode      : %s" % MODE)
 
-    # WARMUP every endpoint. Each glmocr process loads its own layout model on ITS
-    # first request; an unwarmed backend dumps that one-off cost into the first
-    # measured level and fakes a low parallelism number.
-    print("\n=== WARMUP (all endpoints — first call per process loads the layout model) ===")
+    if MODE == "coldstart":
+        run_coldstart(images)
+        sys.exit(0)
+
+    # Warm every endpoint. Each glmocr process loads its layout model on ITS first
+    # request; an unwarmed backend dumps that one-off cost into the first measured level
+    # and fakes a low parallelism number.
+    print("\n=== WARMUP ===")
     first = None
     for e in ENDPOINTS:
         r = call(e, images[0], "warm")
-        print("  %-45s wall=%.1fs md=%d %s" % (e, r["wall"], r["md_len"], r["error"]))
-        if first is None:
-            first = r
+        show(r, "  ")
+        first = first or r
     if not first["ok"]:
         print("\n!! WARMUP FAILED — nothing below would mean anything.")
         if not first["error"]:
@@ -317,7 +389,9 @@ if __name__ == "__main__":
 
     contract_check(first["_body"], images[0])
 
-    if MODE in ("ladder", "both"):
+    if MODE in ("ladder", "all"):
         run_ladder(images)
-    if MODE in ("stress", "both"):
+    if MODE in ("stress", "all"):
         run_stress(images)
+    if MODE == "all":
+        run_coldstart(images)

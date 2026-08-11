@@ -83,7 +83,70 @@ Pod 是同步 HTTP,最简单。Serverless 要 create → poll:
 
 ---
 
-## 2c. 运行策略(Lotion 拍板)—— 一张卡定死 + 自己排队 + 白天热晚上冷
+## 2c. 运行策略 —— **Flex + FlashBoot**(现行方案)
+
+> **2026-08-11 改版。** 原方案是「定时脚本翻 `workersMin`」,但 Lotion 在 RunPod
+> organization 里**不是 owner**,拿不到端点写权限。改走 Flex + FlashBoot ——
+> 不需要任何端点写权限,而且如果 FlashBoot 有效会更便宜。
+> 旧方案存档在 §2c-old,只有「FlashBoot 实测无效」**且**「拿到端点写权限」时才复活。
+
+### 端点配置
+
+| 设置 | 值 | 说明 |
+|---|---|---|
+| Endpoint Type | **Queue** | LB 端点无 worker 时 2 分钟超时,冷启动 6-7 分钟必挂 |
+| GPU | **24 GB**(L4/A5000/3090) | Phase 1 实测档位 |
+| **Active Workers** | **0** | 永远 0,不再翻开关 |
+| **Max Workers** | **1** | 一张卡;突发**排队**不扩容 |
+| **Idle Timeout** | **600s** 起步 | 测完 FlashBoot 再定 |
+| **FlashBoot** | **Enabled** | 现在它是主力,不是附赠 |
+| Env | `MAX_CONCURRENCY=4` | 占位,待 ladder 标定 |
+
+### 全部押在 FlashBoot 上 —— 所以它必须先被验证
+
+FlashBoot 是 **CRIU 式进程快照**:worker 缩到 0 时把整个进程树的状态(含 CUDA 显存)
+快照下来,下次直接复活。官方原话:
+
+> *FlashBoot only snapshots state that already exists in the worker process when it
+> scales to zero.*
+
+我们的 worker 缩零时 vLLM **已经编译完、CUDA graph 已经捕获完** —— 那 301 秒的成果就在
+进程状态里。快照若抓到了,冷启动问题直接消失。
+
+**但不能假设。** 两条反证:
+1. 公开 issue「Very slow cold starts even with flashboot」,而且正好是 **vLLM worker**
+2. 快照存**宿主机本地**,下次落到别的机器就没有
+
+所以 Phase 2 的**第一件事**是 `MODE=coldstart` —— 打一次、等过 idle timeout、再打一次,
+读 RunPod 返回的 `delayTime`。判定标准写死在脚本里:
+
+| 最坏复活延迟 | 结论 |
+|---|---|
+| **< 60s** | FlashBoot 有效 → Idle Timeout 降到 60s,最省钱的配置 |
+| 60-180s | 有帮助但不免费 → Idle Timeout 保持 600s |
+| **> 180s** | **无效**(完整启动 ~400s)→ 要么拉长 Idle Timeout 盖住工作日,要么复活 §2c-old。**绝不能让用户等 6 分钟出第一页** |
+
+### 成本
+
+| 方案 | 月成本 | 前提 |
+|---|---|---|
+| **Flex + FlashBoot + idle 600s** | **~$27** | FlashBoot 有效 |
+| Flex + idle 1 小时(硬扛) | ~$180 | FlashBoot 无效时的退路 |
+| §2c-old 定时 Active | ~$115 | 需端点写权限(现在没有) |
+
+FlashBoot 若有效,这条路**比原方案便宜 4 倍,且零脚本零权限**。
+
+### 权限:降到最低档
+
+| | §2c-old | 现行 |
+|---|---|---|
+| 需要的 API key 权限 | 改端点(`PATCH workersMin`) | **只要能跑 job** |
+
+调用端点本身就要认证,这个绕不过 —— 生产的 C# 端也需要同一档权限。
+
+---
+
+## 2c-old. 定时 Active 方案(存档,当前不用)—— 一张卡定死 + 白天热晚上冷
 
 ### 端点配置
 
