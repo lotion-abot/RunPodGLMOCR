@@ -1,0 +1,13 @@
+# Keep the build context small — RunPod uploads it before building.
+# Only what the Dockerfile actually COPYs needs to be here.
+*.md
+podexec.ps1
+pod_setup.sh
+pod_test.py
+runpod_test.py
+warm_schedule.py
+__pycache__/
+*.pyc
+pod_output.json
+runpod_stress_results.json
+.git/

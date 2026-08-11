@@ -1,0 +1,7 @@
+# The image runs Linux. A start.sh checked out with CRLF dies with
+#   $'\r': command not found
+# and the error names nothing useful. Force LF for everything the container executes,
+# regardless of anyone's core.autocrlf setting.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
