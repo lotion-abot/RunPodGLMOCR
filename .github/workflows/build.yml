@@ -8,16 +8,16 @@ name: Build and push GLM-OCR worker
 # page, so the image must stay PRIVATE. GHCR gives private packages for free and
 # authenticates with the built-in GITHUB_TOKEN - no extra secret to manage here.
 
+# MANUAL ONLY. We moved to local build+push (build_push.ps1): the layer cache makes a
+# code-change rebuild take seconds instead of ~10 min per CI round, and the pre-push
+# probe stops a broken image before 8-12 GB goes over the wire.
+#
+# This stays as the fallback for when the local machine can't build - a clean-room
+# rebuild with no local state. Run it from the Actions tab.
+#
+# Do NOT re-enable the push trigger while local push is the primary path: two builders
+# racing on the same tags is how you end up unsure which image is actually deployed.
 on:
-  push:
-    branches: [main]
-    paths:
-      - Dockerfile
-      - handler.py
-      - start.sh
-      - runner.py
-      - selftest_page.png
-      - .github/workflows/build.yml
   workflow_dispatch:
 
 jobs:
