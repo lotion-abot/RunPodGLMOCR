@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir --ignore-installed blinker
 # The assert is the point: if pip's resolver ever moves vllm or torch out from under us,
 # the BUILD fails loudly instead of shipping a worker that returns silent garbage.
 RUN pip install --no-cache-dir \
+        "prometheus-fastapi-instrumentator>=7.0.2" \
         "glmocr[selfhosted,server]==0.1.5" \
         "transformers==5.15.0" \
         "runpod" \
