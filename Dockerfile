@@ -30,7 +30,7 @@ RUN pip install --no-cache-dir \
         "glmocr[selfhosted,server]==0.1.5" \
         "transformers==5.15.0" \
         "runpod" \
- && python -c "\
+ && python3 -c "\
 import vllm, torch, transformers, glmocr; \
 assert vllm.__version__ == '0.19.1', 'vllm drifted: ' + vllm.__version__; \
 assert torch.__version__.startswith('2.10.0'), 'torch drifted: ' + torch.__version__; \
@@ -40,7 +40,7 @@ print('PINNED OK  vllm', vllm.__version__, '| torch', torch.__version__, '| tran
 # Bake BOTH models into the image. Downloading them at boot proved flaky before - one
 # boot came up with a broken layout model and served empty markdown for a whole session.
 # Baked = deterministic, and no Hugging Face dependency at runtime.
-RUN python -c "\
+RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
 [print('baked', r, '->', snapshot_download(r)) for r in ('zai-org/GLM-OCR', 'PaddlePaddle/PP-DocLayoutV3_safetensors')]"
 
@@ -63,7 +63,7 @@ RUN printf '%s\n' \
       '  port: 5002' \
       '  debug: false' \
       > /app/overrides.yaml \
- && python /app/runner.py /app/overrides.yaml /app/glmocr.yaml \
+ && python3 /app/runner.py /app/overrides.yaml /app/glmocr.yaml \
  && grep -q label_task_mapping /app/glmocr.yaml \
  && echo "merged config OK (label_task_mapping present)"
 
@@ -76,7 +76,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/*
 COPY make_selftest_page.py /app/make_selftest_page.py
-RUN python /app/make_selftest_page.py /app/selftest_page.png
+RUN python3 /app/make_selftest_page.py /app/selftest_page.png
 
 COPY handler.py /app/handler.py
 COPY start.sh    /app/start.sh
