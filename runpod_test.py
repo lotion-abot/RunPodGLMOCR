@@ -39,33 +39,55 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-# ======================= CONFIG (edit here) =======================
-# serverless: set both. direct: leave ENDPOINT_ID empty and set ENDPOINTS.
-ENDPOINT_ID = os.environ.get("RUNPOD_ENDPOINT_ID", "")
-API_KEY = os.environ.get("RUNPOD_API_KEY", "")
+# ======================= CONFIG (edit here, then just `py runpod_test.py`) =======================
+# serverless: set ENDPOINT_ID. direct (pod / SSH tunnel): set it to "" and use ENDPOINTS.
+ENDPOINT_ID = "5v72jxyxmp31jv"
 
-ENDPOINTS = os.environ.get("ENDPOINTS", "http://localhost:5002").split(",")
+ENDPOINTS = ["http://localhost:5002"]        # only used when ENDPOINT_ID == ""
 
-IMAGE_DIR = os.environ.get(
-    "IMAGE_DIR",
-    r"\\ABOT-TEST-03\MBRSUploadTraining\YE2026\3C876CBE-23C6-4DA5-B082-23483B4063BA\SplitImage")
+IMAGE_DIR = r"\\ABOT-TEST-03\MBRSUploadTraining\YE2026\3C876CBE-23C6-4DA5-B082-23483B4063BA\SplitImage"
 
-MODE = os.environ.get("MODE", "ladder")      # ladder | stress | coldstart | all
+MODE = "ladder"                              # ladder | stress | coldstart | all
 
-LADDER_LEVELS = [1, 2, 3, 4, 6, 8, 12]
+# SAME_IMAGE: use ONE page for every call, so per-level numbers differ only by
+# concurrency, not by which pages the rotation happened to deal (the N=6/8 dips in
+# the first ladder were exactly that - those levels drew the heavy full-text pages).
+#   ""              off: rotate distinct pages (realistic, no cache help)
+#   "1"             use the first page of the corpus
+#   "Page_012.png"  use that specific page
+# CAVEAT: vLLM has prefix caching enabled, so repeating one page may score FASTER
+# than real mixed traffic. Same-image mode is for COMPARING levels fairly, not for
+# quoting absolute throughput - quote absolute numbers from distinct-page runs.
+SAME_IMAGE = "Page_012.png"
+
+LADDER_LEVELS = [14, 16, 18, 20, 22, 24]
 LADDER_STOP_ON_EMPTY = True
 PAUSE_BETWEEN_LEVELS = 3
 
-STRESS_TOTAL = int(os.environ.get("STRESS_TOTAL", "30"))
-STRESS_CONC = int(os.environ.get("STRESS_CONC", "6"))
+STRESS_TOTAL = 30
+STRESS_CONC = 6
 
 # Gaps (seconds) between coldstart probes. Each must EXCEED the endpoint's idle timeout
 # or the worker never scales down and the probe measures nothing.
-COLDSTART_GAPS = [int(g) for g in os.environ.get("COLDSTART_GAPS", "700,700,700").split(",")]
+COLDSTART_GAPS = [700, 700]
 
 TIMEOUT = 900
 RETRIES = 0
 POLL_S = 2.0
+
+# The API key is NOT hardcoded on purpose - this file lives in the git repo, and a
+# pasted key would leak the way the GitHub token pasted into chat did. It is read from
+# the file `flash login` writes; nothing to set, no env var needed.
+def _load_key():
+    try:
+        import re
+        cfg = open(os.path.join(os.path.expanduser("~"), ".runpod", "config.toml")).read()
+        m = re.search(r'(?im)^\s*(?:api_key|apikey|key)\s*=\s*"?([^"\r\n]+)"?', cfg)
+        return m.group(1).strip() if m else ""
+    except OSError:
+        return ""
+
+API_KEY = _load_key()
 # ==================================================================
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -368,8 +390,24 @@ if __name__ == "__main__":
     if not images:
         sys.exit("no Page_*.png found in %s" % IMAGE_DIR)
 
+    if SAME_IMAGE:
+        if SAME_IMAGE == "1":
+            target = images[0]
+        else:
+            match = [p for p in images if os.path.basename(p).lower() == SAME_IMAGE.lower()]
+            if not match:
+                sys.exit("SAME_IMAGE=%r not found in %s" % (SAME_IMAGE, IMAGE_DIR))
+            target = match[0]
+        # a single-element corpus: every rotation index maps to the same page
+        images = [target]
+
     print("transport : %s" % ("serverless " + ENDPOINT_ID if SERVERLESS else "direct " + str(ENDPOINTS)))
-    print("corpus    : %d pages from %s" % (len(images), IMAGE_DIR))
+    if SAME_IMAGE:
+        print("corpus    : SAME-IMAGE mode -> %s for every call" % os.path.basename(images[0]))
+        print("            (fair level-to-level comparison; prefix cache may flatter")
+        print("             absolute numbers - quote those from distinct-page runs)")
+    else:
+        print("corpus    : %d pages from %s" % (len(images), IMAGE_DIR))
     print("mode      : %s" % MODE)
 
     if MODE == "coldstart":
