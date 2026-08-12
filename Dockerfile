@@ -81,6 +81,7 @@ COPY make_selftest_page.py /app/make_selftest_page.py
 RUN python3 /app/make_selftest_page.py /app/selftest_page.png
 
 COPY handler.py /app/handler.py
+COPY glmocr_clean.py /app/glmocr_clean.py
 COPY start.sh    /app/start.sh
 RUN chmod +x /app/start.sh
 

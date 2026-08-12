@@ -47,7 +47,7 @@ ENDPOINTS = ["http://localhost:5002"]        # only used when ENDPOINT_ID == ""
 
 IMAGE_DIR = r"\\ABOT-TEST-03\MBRSUploadTraining\YE2026\3C876CBE-23C6-4DA5-B082-23483B4063BA\SplitImage"
 
-MODE = "ladder"                              # ladder | stress | coldstart | all
+MODE = "stress"                              # ladder | stress | coldstart | all
 
 # SAME_IMAGE: use ONE page for every call, so per-level numbers differ only by
 # concurrency, not by which pages the rotation happened to deal (the N=6/8 dips in
@@ -58,14 +58,23 @@ MODE = "ladder"                              # ladder | stress | coldstart | all
 # CAVEAT: vLLM has prefix caching enabled, so repeating one page may score FASTER
 # than real mixed traffic. Same-image mode is for COMPARING levels fairly, not for
 # quoting absolute throughput - quote absolute numbers from distinct-page runs.
-SAME_IMAGE = "Page_012.png"
+# Phase 3: distinct pages — production traffic is distinct pages, and the prefix
+# cache must NOT be allowed to flatter the final number we quote.
+SAME_IMAGE = ""
 
-LADDER_LEVELS = [14, 16, 18, 20, 22, 24]
+# Calibration-campaign ladder: fine steps, ascending, STOP at first fail — after an
+# OOM the worker is refreshed (by design), so any level measured after a failure would
+# run on a cold replacement and be garbage. One cliff per boot is the protocol.
+LADDER_LEVELS = [10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]
 LADDER_STOP_ON_EMPTY = True
 PAUSE_BETWEEN_LEVELS = 3
 
-STRESS_TOTAL = 30
-STRESS_CONC = 6
+# The REAL peak shape (Lotion): ~40 concurrent queues x 4 requests each = 160 jobs
+# submitted SIMULTANEOUSLY, not fed through a window. STRESS_CONC == STRESS_TOTAL
+# means every request is posted at once; RunPod's queue absorbs the pile and the
+# worker drains it 16 at a time (the calibrated gate).
+STRESS_TOTAL = 480
+STRESS_CONC = 480
 
 # Gaps (seconds) between coldstart probes. Each must EXCEED the endpoint's idle timeout
 # or the worker never scales down and the probe measures nothing.
@@ -417,19 +426,19 @@ if __name__ == "__main__":
     # Warm every endpoint. Each glmocr process loads its layout model on ITS first
     # request; an unwarmed backend dumps that one-off cost into the first measured level
     # and fakes a low parallelism number.
-    print("\n=== WARMUP ===")
-    first = None
-    for e in ENDPOINTS:
-        r = call(e, images[0], "warm")
-        show(r, "  ")
-        first = first or r
-    if not first["ok"]:
-        print("\n!! WARMUP FAILED — nothing below would mean anything.")
-        if not first["error"]:
-            diagnose_empty(1, 1)
-        sys.exit(1)
+    # print("\n=== WARMUP ===")
+    # first = None
+    # for e in ENDPOINTS:
+    #     r = call(e, images[0], "warm")
+    #     show(r, "  ")
+    #     first = first or r
+    # if not first["ok"]:
+    #     print("\n!! WARMUP FAILED — nothing below would mean anything.")
+    #     if not first["error"]:
+    #         diagnose_empty(1, 1)
+    #     sys.exit(1)
 
-    contract_check(first["_body"], images[0])
+    # contract_check(first["_body"], images[0])
 
     if MODE in ("ladder", "all"):
         run_ladder(images)

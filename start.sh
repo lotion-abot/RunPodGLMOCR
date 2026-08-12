@@ -47,9 +47,12 @@ for i in $(seq 1 600); do
 done
 
 echo "=== 2/3  glmocr on :$GLMOCR_PORT ==="
-# Config was merged at BUILD time (/app/glmocr.yaml) — nothing to generate here.
+# Config was merged at BUILD time (/app/glmocr.yaml). Launched through glmocr_clean.py:
+# Lotion's ruling - NO proactive kill-and-restart. The wrapper cleans in place after
+# every parse (gc.collect + malloc_trim). If cleaning cannot hold the line, the
+# container gets OOM-killed by RunPod at its RAM cap - that trade was accepted.
 launch_glmocr() {
-  python3 -m glmocr.server --config /app/glmocr.yaml >> "$GLMOCR_LOG" 2>&1 &
+  python3 /app/glmocr_clean.py --config /app/glmocr.yaml >> "$GLMOCR_LOG" 2>&1 &
   GLMOCR_PID=$!
   for i in $(seq 1 150); do
     # '/' legitimately 404s — any HTTP answer means the server is listening.
@@ -59,13 +62,6 @@ launch_glmocr() {
   done
   tail -40 "$GLMOCR_LOG"
   return 1
-}
-
-recycle_glmocr() {
-  kill "$GLMOCR_PID" 2>/dev/null || true
-  sleep 2
-  kill -9 "$GLMOCR_PID" 2>/dev/null || true
-  launch_glmocr
 }
 
 if ! launch_glmocr; then echo "glmocr failed to start"; exit 1; fi
@@ -81,14 +77,12 @@ HANDLER_PID=$!
 #    Flask and the handler stayed up, silently blanking every page. A worker whose OCR
 #    brain is gone must DIE so RunPod replaces it.
 #
-# 2. The RAM-leak lesson (measured 2026-08-12, worker 7c9b354e8794): the glmocr
-#    process leaks host RAM under sustained load - 11+ GiB mid-burst and climbing -
-#    until the CONTAINER hits its 46.57 GiB limit and RunPod hard-kills it, taking
-#    every in-flight job down. glmocr is cheaply replaceable (layout model reloads
-#    from local disk in seconds; vLLM keeps running), so: recycle it BEFORE the
-#    container limit, and respawn it if it dies on its own. The handler rides through
-#    the gap by retrying parses for ~40s. Container death is reserved for vLLM.
-GLMOCR_RSS_LIMIT_KB="${GLMOCR_RSS_LIMIT_KB:-20971520}"   # 20 GiB - well under the container cap
+# 2. Respawn glmocr if it DIES ON ITS OWN (crash / OS OOM-kill). This is recovery,
+#    not the proactive RSS-triggered recycle - that fence was removed by Lotion's
+#    ruling (2026-08-13): in-place cleaning only (see glmocr_clean.py). The watchdog
+#    still LOGS glmocr's RSS once a minute so the cleaning's effect is visible in the
+#    worker log; it never acts on it.
+TICK=0
 while true; do
   if ! kill -0 "$VLLM_PID" 2>/dev/null; then
     echo "WATCHDOG: vLLM process died - tail of /var/log/vllm.log follows; exiting so RunPod replaces this worker"
@@ -106,15 +100,10 @@ while true; do
     fi
     echo "WATCHDOG: glmocr respawned (pid $GLMOCR_PID)"
   fi
-  RSS_KB=$(ps -o rss= -p "$GLMOCR_PID" 2>/dev/null | tr -d ' ')
-  if [ -n "$RSS_KB" ] && [ "$RSS_KB" -gt "$GLMOCR_RSS_LIMIT_KB" ]; then
-    echo "WATCHDOG: glmocr RSS ${RSS_KB}KB > ${GLMOCR_RSS_LIMIT_KB}KB - recycling it (vLLM stays up)"
-    if ! recycle_glmocr; then
-      echo "WATCHDOG: glmocr recycle FAILED - exiting so RunPod replaces the worker"
-      kill "$HANDLER_PID" "$VLLM_PID" 2>/dev/null || true
-      exit 1
-    fi
-    echo "WATCHDOG: glmocr recycled (pid $GLMOCR_PID)"
+  TICK=$((TICK + 1))
+  if [ $((TICK % 6)) -eq 0 ]; then
+    RSS_KB=$(ps -o rss= -p "$GLMOCR_PID" 2>/dev/null | tr -d ' ')
+    echo "RSS-REPORT: glmocr ${RSS_KB:-?} KB"
   fi
   if ! kill -0 "$HANDLER_PID" 2>/dev/null; then
     wait "$HANDLER_PID"; rc=$?
