@@ -14,6 +14,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
+# The base image carries an APT-installed blinker 1.4 (from python3-launchpadlib).
+# glmocr[server] pulls Flask, Flask wants a newer blinker, and pip refuses to uninstall
+# a distutils-installed package:
+#     Cannot uninstall blinker 1.4 ... it is a distutils installed project
+# Installing it once with --ignore-installed puts a pip-managed copy in site-packages
+# that shadows the apt one, after which the real install can upgrade it normally.
+# If another apt-installed package ever trips the same wall, add it to this line.
+RUN pip install --no-cache-dir --ignore-installed blinker
+
 # glmocr on top of the vLLM image. transformers is pinned to what Phase 1 actually ran.
 # The assert is the point: if pip's resolver ever moves vllm or torch out from under us,
 # the BUILD fails loudly instead of shipping a worker that returns silent garbage.
