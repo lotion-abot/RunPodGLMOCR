@@ -50,8 +50,12 @@ SELFTEST_PAGE = "/app/selftest_page.png"
 # with 3 processes and does NOT carry over to util=0.70 with 1. Default is deliberately
 # conservative until the ladder speaks.
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "4"))
-SELFTEST_MIN_MD = int(os.environ.get("SELFTEST_MIN_MD", "800"))
 PARSE_TIMEOUT = float(os.environ.get("PARSE_TIMEOUT", "300"))
+
+# Printed on the generated self-test page (make_selftest_page.py). Checking for these
+# beats a minimum-length threshold: a threshold has to be re-tuned every time the page
+# changes, and it passes on garbage of the right size.
+SENTINEL_WORDS = ("SELFTEST", "SENTINEL", "BRAVO")
 
 _gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -149,22 +153,39 @@ def _selftest():
         r.raise_for_status()
         body = r.json()
     out = _adapt(body, w, h)
-    md, n = out["md_results"], len(out["layout_details"])
+    md, elems = out["md_results"], out["layout_details"]
     log.info("selftest: %.1fs  md=%d  elements=%d  page=%dx%d",
-             time.perf_counter() - t0, len(md), n, w, h)
+             time.perf_counter() - t0, len(md), len(elems), w, h)
 
-    if len(md) < SELFTEST_MIN_MD:
+    # 1. Did we transcribe the page at all? The sentinel sits at the BOTTOM, so finding
+    #    it also proves the tail was read, not just the first block.
+    flat = "".join(ch for ch in md.upper() if ch.isalnum())
+    hits = [wd for wd in SENTINEL_WORDS if wd in flat]
+    if len(hits) < 2:
         raise RuntimeError(
-            "self-test FAILED: md=%d < %d. Empty/short output on a known-good page is the "
-            "layout CUDA-OOM signature. Check /var/log/glmocr.log and lower "
-            "GPU_MEMORY_UTILIZATION (currently %s)."
-            % (len(md), SELFTEST_MIN_MD, os.environ.get("GPU_MEMORY_UTILIZATION"))
+            "self-test FAILED: sentinel not found (matched %s of %s), md=%d. On a page "
+            "this legible that means the layout stage skipped the batch — the CUDA-OOM "
+            "signature. Check /var/log/glmocr.log and lower GPU_MEMORY_UTILIZATION "
+            "(currently %s)." % (hits, list(SENTINEL_WORDS), len(md),
+                                 os.environ.get("GPU_MEMORY_UTILIZATION"))
         )
-    # A boot where bbox came back unscaled would silently misplace every letterhead.
-    xs = [c for e in out["layout_details"] if isinstance(e.get("bbox_2d"), list)
-          for c in e["bbox_2d"][0::2]]
+
+    # 2. Did label_task_mapping survive the config merge? If it didn't, every element
+    #    degrades to 'text' and the C# title / dedup / header-recovery logic goes blind.
+    vocab = {e.get("native_label") for e in elems}
+    if vocab and vocab <= {"text"}:
+        raise RuntimeError(
+            "self-test FAILED: every native_label is 'text' — label_task_mapping was lost "
+            "in the config merge. Expected paragraph_title and table on this page."
+        )
+
+    # 3. Was bbox rescaled? Unscaled coordinates keep every field looking correct while
+    #    letterhead stitching silently misplaces.
+    xs = [c for e in elems if isinstance(e.get("bbox_2d"), list) for c in e["bbox_2d"][0::2]]
     if xs and max(xs) <= 1000 < w:
         raise RuntimeError("self-test FAILED: bbox still <=1000 after scaling — adapter broken")
+
+    log.info("selftest PASSED: sentinel %s, labels %s", hits, sorted(vocab))
 
 
 # ------------------------------------------------------------------ handler

@@ -418,10 +418,30 @@ Phase 2 要按序试这三个,**每个都量启动时间和吞吐**,不预设结
 | 镜像存哪 | RunPod 自有 registry | GHCR **私有** package |
 | 版本可控性 | 跟分支走 | **按 commit SHA 打标签**,端点钉死某个 SHA |
 
-选 GHCR 的两个理由:
-1. **Lotion 在 organization 里不是 owner**,连 GitHub 到 RunPod 这一步大概率做不了
-2. 镜像里烘了 `selftest_page.png`,那是**真实客户审计页**,镜像**必须私有**。
-   GHCR 私有 package 免费,而且用内置 `GITHUB_TOKEN` 认证,不用额外管密钥
+选 GHCR 的理由:**Lotion 在 organization 里不是 owner**,把 GitHub 连到 RunPod 是 owner 级操作,做不了。
+GHCR 只要在建端点时填一个镜像 URL。
+
+### 镜像是公开的 —— 因为里面没有客户数据
+
+原本自检要烘一张**真实客户审计页**,那就逼着镜像必须私有 → 私有就要 GitHub PAT →
+还要在 RunPod 配 registry 凭证。**两个步骤,只为保护一个文件。**
+
+改成 `make_selftest_page.py` **在构建时生成**一张假页(3166×4096 全尺寸、约 20 个块、
+一张带框的表,内容全是编的)。镜像里没有客户数据 → 可以公开 → **PAT 和 registry 凭证
+两步一起消失**。
+
+> 仓库仍然私有(它有文档和 pod 工具);只有**镜像**公开。镜像内容 = 开源软件 + 我们几百行代码。
+
+自检怎么保证还有效:假页底部印一句暗号 `SELFTEST SENTINEL BRAVO`,handler 检查
+**认出来的文字里有没有这句暗号**(3 个词命中 ≥2 即可,容忍 OCR 噪声)。比原来「看字数够不够」更硬 ——
+字数阈值每次改页面都要重调,而且一堆乱码只要长度够也能骗过去。
+
+自检一共卡三件事,全是**会静默返回空 markdown** 的故障:
+1. **暗号找不到** → layout 撞 OOM 跳过了批次(暗号在页尾,找到它同时证明整页读完了)
+2. **`native_label` 全是 `text`** → 配置合并丢了 `label_task_mapping`
+3. **bbox 仍 ≤1000** → 坐标换算没生效
+
+假页验不了真实扫描件的排版怪癖 —— 但开机自检本来也不负责那个,那是 ladder 和黄金样本比对的事。
 
 实现:`.github/workflows/build.yml`。push 到 main 且动了 Dockerfile/handler/start.sh/
 runner.py/selftest_page.png 时自动构建,推两个 tag:`:latest` 和 `:<commit-sha>`。
@@ -429,19 +449,16 @@ runner.py/selftest_page.png 时自动构建,推两个 tag:`:latest` 和 `:<commi
 > **端点要钉 SHA tag,不要钉 `:latest`。**「现在到底跑的是哪个镜像」不能靠猜 ——
 > 这正是 Replicate 那边 deployment 停在旧版本、白跑三次 warm6 的原因。
 
-### ⚠️ 私有 GHCR 需要在 RunPod 配 registry 凭证
+### 一次性:把 GHCR package 设成 Public
 
-RunPod 拉不了私有 ghcr.io 镜像,除非先配好凭证:
+CI 第一次构建成功后,GHCR 上会出现一个 package,**默认私有**。去改成 public:
 
-**Settings → Registry Credentials → 新建一条**
-- Registry: `ghcr.io`
-- Username: 你的 GitHub 用户名(`lotion-abot`)
-- Password: 一个 GitHub **PAT**,勾选 `read:packages` 权限
+**https://github.com/users/lotion-abot/packages/container/runpodglmocr/settings**
+→ Danger Zone → **Change visibility** → Public
 
-建端点时在 Container Image 填 `ghcr.io/lotion-abot/runpodglmocr:<sha>`(**小写**,GHCR 不收大写),
-并选上这条凭证。
+改完 RunPod 直接拉,**不需要任何凭证**。
 
-> 粘贴时别带空格 —— 这是这一步最常见的失败原因。
+建端点时 Container Image 填 `ghcr.io/lotion-abot/runpodglmocr:<sha>` —— **全小写**,GHCR 不收大写。
 
 ---
 
