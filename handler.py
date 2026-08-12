@@ -109,10 +109,39 @@ def _flat(body):
     return ld[0] if (ld and isinstance(ld[0], list)) else ld
 
 
+class _EngineDead(Exception):
+    """vLLM is gone; the worker must be replaced."""
+
+
 async def _parse(client, uri):
     r = await client.post(GLMOCR_URL, json={"images": [uri]})
     r.raise_for_status()
     return r.json()
+
+
+PARSE_RECYCLE_TRIES = int(os.environ.get("PARSE_RECYCLE_TRIES", "8"))
+
+
+async def _parse_resilient(client, uri):
+    """glmocr may be mid-recycle: the watchdog respawns it when its RSS crosses the
+    limit (measured leak: 11+ GiB and climbing during a sustained burst; the container
+    got OOM-killed at its 46.57 GiB cap, taking every in-flight job with it). A parse
+    that fails on transport or 5xx while vLLM is still alive waits out the respawn
+    (~40s window) instead of failing the job. Only a dead vLLM aborts immediately."""
+    last = None
+    for i in range(PARSE_RECYCLE_TRIES):
+        try:
+            return await _parse(client, uri)
+        except (httpx.TransportError, httpx.HTTPStatusError) as ex:
+            last = ex
+            if not _vllm_alive():
+                raise _EngineDead() from ex
+            log.warning("glmocr unreachable/5xx (recycle in progress?) try %d/%d: %s",
+                        i + 1, PARSE_RECYCLE_TRIES, ex)
+            await asyncio.sleep(5)
+    raise RuntimeError(
+        "glmocr stayed unreachable for ~%ds while vLLM was alive — recycle stuck? "
+        "Last error: %s" % (PARSE_RECYCLE_TRIES * 5, last))
 
 
 def _adapt(body, width, height):
@@ -224,7 +253,15 @@ async def handler(job):
         async with httpx.AsyncClient(timeout=PARSE_TIMEOUT) as client:
             for attempt in (1, 2):
                 mark = _log_offset()
-                body = await _parse(client, uri)
+                try:
+                    body = await _parse_resilient(client, uri)
+                except _EngineDead:
+                    log.error("vLLM dead while parsing — failing job and requesting "
+                              "worker refresh")
+                    return {
+                        "error": "vLLM engine died (see /var/log/vllm.log); worker is being replaced",
+                        "refresh_worker": True,
+                    }
                 out = _adapt(body, width, height)
 
                 if out["md_results"].strip():

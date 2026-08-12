@@ -48,27 +48,47 @@ done
 
 echo "=== 2/3  glmocr on :$GLMOCR_PORT ==="
 # Config was merged at BUILD time (/app/glmocr.yaml) — nothing to generate here.
-python3 -m glmocr.server --config /app/glmocr.yaml > "$GLMOCR_LOG" 2>&1 &
-GLMOCR_PID=$!
+launch_glmocr() {
+  python3 -m glmocr.server --config /app/glmocr.yaml >> "$GLMOCR_LOG" 2>&1 &
+  GLMOCR_PID=$!
+  for i in $(seq 1 150); do
+    # '/' legitimately 404s — any HTTP answer means the server is listening.
+    if curl -s -o /dev/null "http://127.0.0.1:$GLMOCR_PORT/" 2>/dev/null; then return 0; fi
+    if ! kill -0 "$GLMOCR_PID" 2>/dev/null; then tail -40 "$GLMOCR_LOG"; return 1; fi
+    sleep 2
+  done
+  tail -40 "$GLMOCR_LOG"
+  return 1
+}
 
-echo -n "    waiting "
-for i in $(seq 1 300); do
-  # '/' legitimately 404s — any HTTP answer means the server is listening.
-  if curl -s -o /dev/null "http://127.0.0.1:$GLMOCR_PORT/" 2>/dev/null; then echo " UP"; break; fi
-  if ! kill -0 "$GLMOCR_PID" 2>/dev/null; then echo " DIED"; tail -60 "$GLMOCR_LOG"; exit 1; fi
-  if [ "$i" = "300" ]; then echo " TIMEOUT"; tail -60 "$GLMOCR_LOG"; exit 1; fi
+recycle_glmocr() {
+  kill "$GLMOCR_PID" 2>/dev/null || true
   sleep 2
-done
+  kill -9 "$GLMOCR_PID" 2>/dev/null || true
+  launch_glmocr
+}
+
+if ! launch_glmocr; then echo "glmocr failed to start"; exit 1; fi
+echo "    UP"
 
 echo "=== 3/3  handler (self-test runs at import) ==="
 python3 /app/handler.py &
 HANDLER_PID=$!
 
-# WATCHDOG - the zombie lesson. When EngineCore died mid-session, the vLLM process
-# exited but Flask and the handler stayed up, so the worker kept answering HTTP 200
-# with empty markdown for every job it took. A worker whose OCR brain is gone must
-# DIE, not serve: exiting here makes RunPod replace it (a clean cold boot) instead of
-# letting it silently blank pages until someone notices.
+# WATCHDOG - two duties.
+#
+# 1. The zombie lesson: when EngineCore died mid-session, the vLLM process exited but
+#    Flask and the handler stayed up, silently blanking every page. A worker whose OCR
+#    brain is gone must DIE so RunPod replaces it.
+#
+# 2. The RAM-leak lesson (measured 2026-08-12, worker 7c9b354e8794): the glmocr
+#    process leaks host RAM under sustained load - 11+ GiB mid-burst and climbing -
+#    until the CONTAINER hits its 46.57 GiB limit and RunPod hard-kills it, taking
+#    every in-flight job down. glmocr is cheaply replaceable (layout model reloads
+#    from local disk in seconds; vLLM keeps running), so: recycle it BEFORE the
+#    container limit, and respawn it if it dies on its own. The handler rides through
+#    the gap by retrying parses for ~40s. Container death is reserved for vLLM.
+GLMOCR_RSS_LIMIT_KB="${GLMOCR_RSS_LIMIT_KB:-20971520}"   # 20 GiB - well under the container cap
 while true; do
   if ! kill -0 "$VLLM_PID" 2>/dev/null; then
     echo "WATCHDOG: vLLM process died - tail of /var/log/vllm.log follows; exiting so RunPod replaces this worker"
@@ -77,10 +97,24 @@ while true; do
     exit 1
   fi
   if ! kill -0 "$GLMOCR_PID" 2>/dev/null; then
-    echo "WATCHDOG: glmocr server died - tail of $GLMOCR_LOG follows; exiting"
-    tail -40 "$GLMOCR_LOG"
-    kill "$HANDLER_PID" "$VLLM_PID" 2>/dev/null || true
-    exit 1
+    echo "WATCHDOG: glmocr died - respawning it (vLLM stays up); log tail follows"
+    tail -20 "$GLMOCR_LOG"
+    if ! launch_glmocr; then
+      echo "WATCHDOG: glmocr respawn FAILED - exiting so RunPod replaces the worker"
+      kill "$HANDLER_PID" "$VLLM_PID" 2>/dev/null || true
+      exit 1
+    fi
+    echo "WATCHDOG: glmocr respawned (pid $GLMOCR_PID)"
+  fi
+  RSS_KB=$(ps -o rss= -p "$GLMOCR_PID" 2>/dev/null | tr -d ' ')
+  if [ -n "$RSS_KB" ] && [ "$RSS_KB" -gt "$GLMOCR_RSS_LIMIT_KB" ]; then
+    echo "WATCHDOG: glmocr RSS ${RSS_KB}KB > ${GLMOCR_RSS_LIMIT_KB}KB - recycling it (vLLM stays up)"
+    if ! recycle_glmocr; then
+      echo "WATCHDOG: glmocr recycle FAILED - exiting so RunPod replaces the worker"
+      kill "$HANDLER_PID" "$VLLM_PID" 2>/dev/null || true
+      exit 1
+    fi
+    echo "WATCHDOG: glmocr recycled (pid $GLMOCR_PID)"
   fi
   if ! kill -0 "$HANDLER_PID" 2>/dev/null; then
     wait "$HANDLER_PID"; rc=$?
