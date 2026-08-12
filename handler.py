@@ -245,15 +245,25 @@ async def handler(job):
                         "refresh_worker": True,
                     }
 
-                # 2. Layout-stage CUDA OOM: glmocr skipped the batch but the stack is
-                #    otherwise alive. Loud failure; RunPod retries the job.
+                # 2. Layout-stage CUDA OOM. Fail the job loudly AND replace the worker:
+                #    measured 2026-08-12 (worker i5h8psmyp89lcm), a worker that survived
+                #    an OOM burst is WOUNDED - its cliff moved from 18 clean down to 14
+                #    failing on the very next run, same config, from allocator high-water
+                #    and fragmentation the burst left behind. A wounded worker's ceiling
+                #    is silently lower than calibration assumed, so it must not serve on.
                 if _oom_since(mark):
-                    raise RuntimeError(
-                        "layout stage hit CUDA OOM and skipped the batch (attempt %d). "
-                        "Lower MAX_CONCURRENCY (now %d) or GPU_MEMORY_UTILIZATION (now %s), "
-                        "then re-run the ladder in runpod_test.py to re-calibrate."
-                        % (attempt, MAX_CONCURRENCY, os.environ.get("GPU_MEMORY_UTILIZATION"))
-                    )
+                    log.error("layout CUDA OOM (attempt %d) — failing job and requesting "
+                              "worker refresh; post-OOM workers have a degraded ceiling",
+                              attempt)
+                    return {
+                        "error": ("layout stage hit CUDA OOM and skipped the batch "
+                                  "(attempt %d). Lower MAX_CONCURRENCY (now %d) or "
+                                  "GPU_MEMORY_UTILIZATION (now %s), then re-calibrate "
+                                  "with the ladder on a FRESH worker."
+                                  % (attempt, MAX_CONCURRENCY,
+                                     os.environ.get("GPU_MEMORY_UTILIZATION"))),
+                        "refresh_worker": True,
+                    }
                 if attempt == 1:
                     log.warning("empty markdown, vLLM alive, no OOM in log — retrying once")
                     await asyncio.sleep(1.5)
