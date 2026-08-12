@@ -43,6 +43,7 @@ log = logging.getLogger("glmocr-handler")
 
 GLMOCR_URL = "http://127.0.0.1:5002/glmocr/parse"
 GLMOCR_LOG = "/var/log/glmocr.log"
+VLLM_HEALTH = "http://127.0.0.1:8080/health"
 SELFTEST_PAGE = "/app/selftest_page.png"
 
 # MUST be re-calibrated with runpod_test.py's ladder whenever GPU_MEMORY_UTILIZATION,
@@ -77,6 +78,17 @@ def _oom_since(offset):
         return b"skipping batch" in tail or b"out of memory" in tail
     except OSError:
         return False        # can't read the log -> never CLAIM an OOM we didn't see
+
+
+def _vllm_alive():
+    """Is the OCR brain still there? Measured 2026-08-12: EngineCore died on a CUDA
+    device-side assert, the vLLM process exited, and glmocr kept answering HTTP 200
+    with empty markdown - a zombie worker that would have silently blanked every page
+    for the rest of its life. Empty output MUST check this before any other verdict."""
+    try:
+        return httpx.get(VLLM_HEALTH, timeout=5).status_code == 200
+    except Exception:
+        return False
 
 
 # ------------------------------------------------------------------ call + adapt
@@ -218,9 +230,24 @@ async def handler(job):
                 if out["md_results"].strip():
                     return out
 
+                # Empty markdown has THREE causes with three different answers.
+                # Check the decisive ones first; "blank page" is only ever the
+                # verdict of last resort.
+
+                # 1. vLLM engine death (the zombie). Fail the job AND have RunPod
+                #    replace this worker - it cannot recover, and every job it takes
+                #    from now on would come back as a fake blank page.
+                if not _vllm_alive():
+                    log.error("vLLM /health unreachable after empty output — engine is "
+                              "dead; failing job and requesting worker refresh")
+                    return {
+                        "error": "vLLM engine died (see /var/log/vllm.log); worker is being replaced",
+                        "refresh_worker": True,
+                    }
+
+                # 2. Layout-stage CUDA OOM: glmocr skipped the batch but the stack is
+                #    otherwise alive. Loud failure; RunPod retries the job.
                 if _oom_since(mark):
-                    # Loud failure on purpose: RunPod retries the job, and a visible
-                    # error beats audit data that is silently wrong.
                     raise RuntimeError(
                         "layout stage hit CUDA OOM and skipped the batch (attempt %d). "
                         "Lower MAX_CONCURRENCY (now %d) or GPU_MEMORY_UTILIZATION (now %s), "
@@ -228,12 +255,16 @@ async def handler(job):
                         % (attempt, MAX_CONCURRENCY, os.environ.get("GPU_MEMORY_UTILIZATION"))
                     )
                 if attempt == 1:
-                    log.warning("empty markdown, no OOM in log — retrying once")
+                    log.warning("empty markdown, vLLM alive, no OOM in log — retrying once")
                     await asyncio.sleep(1.5)
 
-    # Empty twice, no OOM either time: treat as a genuinely blank page. Blank pages are
-    # common in scans and failing them would stall the whole pipeline.
-    out["warning"] = "empty markdown after 2 attempts; no OOM in glmocr log — treated as a blank page"
+    # Empty twice with vLLM alive and no OOM: treat as a genuinely blank page. Blank
+    # pages are common in scans and failing them would stall the whole pipeline.
+    # (Page_024 taught us this verdict must only come AFTER the engine-death check:
+    # a dense Income Tax page was mislabelled "blank" by exactly this line while the
+    # engine was dead.)
+    out["warning"] = ("empty markdown after 2 attempts; vLLM healthy, no OOM in glmocr "
+                      "log — treated as a blank page")
     log.warning(out["warning"])
     return out
 

@@ -64,7 +64,7 @@ STRESS_CONC = int(os.environ.get("STRESS_CONC", "6"))
 COLDSTART_GAPS = [int(g) for g in os.environ.get("COLDSTART_GAPS", "700,700,700").split(",")]
 
 TIMEOUT = 900
-RETRIES = 2
+RETRIES = 0
 POLL_S = 2.0
 # ==================================================================
 
@@ -190,10 +190,14 @@ def show(r, prefix=""):
 def diagnose_empty(n_empty, level):
     print("")
     print("  >>> %d/%d calls returned EMPTY markdown at concurrency %d." % (n_empty, level, level))
-    print("  >>> That is the LAYOUT-STAGE CUDA OOM signature: the batch is skipped and the")
-    print("  >>> server still answers HTTP 200. Lower MAX_CONCURRENCY or")
-    print("  >>> GPU_MEMORY_UTILIZATION — each glmocr process needs ~1.9 GiB on top of")
-    print("  >>> whatever vLLM reserves. On the worker: grep -c 'out of memory' /var/log/glmocr.log")
+    print("  >>> Two known causes, both now HARD-FAILED by the handler:")
+    print("  >>>   a) layout-stage CUDA OOM (skipped batch, HTTP 200) -> job fails loudly")
+    print("  >>>   b) vLLM engine death (CUDA assert, connection refused) -> job fails +")
+    print("  >>>      worker replaced (refresh_worker)")
+    print("  >>> So an EMPTY that still reaches this client should only be a genuinely")
+    print("  >>> blank page (carries a 'warning' field). Anything else = handler regression.")
+    print("  >>> Worker forensics: grep -inE 'assert|out of memory' /var/log/vllm.log")
+    print("  >>>                   grep -c 'skipping batch' /var/log/glmocr.log")
 
 
 # ------------------------------------------------------------------ contract check
