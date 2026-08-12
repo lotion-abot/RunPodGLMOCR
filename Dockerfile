@@ -27,11 +27,12 @@ RUN pip install --no-cache-dir --ignore-installed blinker
 # The assert is the point: if pip's resolver ever moves vllm or torch out from under us,
 # the BUILD fails loudly instead of shipping a worker that returns silent garbage.
 RUN pip install --no-cache-dir \
+        "fastapi==0.136.3" \
         "prometheus-fastapi-instrumentator>=7.0.2" \
         "glmocr[selfhosted,server]==0.1.5" \
         "transformers==5.15.0" \
         "runpod" \
- && python3 -c "\
+&& python3 -c "\
 import vllm, torch, transformers, glmocr; \
 assert vllm.__version__ == '0.19.1', 'vllm drifted: ' + vllm.__version__; \
 assert torch.__version__.startswith('2.10.0'), 'torch drifted: ' + torch.__version__; \
