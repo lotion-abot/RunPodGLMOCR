@@ -73,8 +73,13 @@ PAUSE_BETWEEN_LEVELS = 3
 # submitted SIMULTANEOUSLY, not fed through a window. STRESS_CONC == STRESS_TOTAL
 # means every request is posted at once; RunPod's queue absorbs the pile and the
 # worker drains it 16 at a time (the calibrated gate).
-STRESS_TOTAL = 480
-STRESS_CONC = 480
+STRESS_TOTAL = 320
+STRESS_CONC = 320
+
+# Repeat the whole burst back-to-back (no pause between cycles). The per-cycle
+# pages/s trend in the final table is the sustained-load health check: flat = the
+# in-place memory cleaning is holding; degrading cycle over cycle = pressure building.
+STRESS_CYCLES = 10
 
 # Gaps (seconds) between coldstart probes. Each must EXCEED the endpoint's idle timeout
 # or the worker never scales down and the probe measures nothing.
@@ -313,39 +318,60 @@ def run_ladder(images):
 # ------------------------------------------------------------------ stress
 def run_stress(images):
     print("\n" + "=" * 74)
-    print("STRESS — %d calls at %d in-flight (distinct pages)" % (STRESS_TOTAL, STRESS_CONC))
+    print("STRESS — %d cycle(s) x %d calls at %d in-flight (distinct pages)"
+          % (STRESS_CYCLES, STRESS_TOTAL, STRESS_CONC))
     print("=" * 74)
-    tasks = [(ENDPOINTS[i % len(ENDPOINTS)], images[i % len(images)], "s%d" % (i + 1))
-             for i in range(STRESS_TOTAL)]
-    results, t0 = [], time.perf_counter()
-    with ThreadPoolExecutor(max_workers=STRESS_CONC) as ex:
-        for f in as_completed([ex.submit(call, e, p, lb) for e, p, lb in tasks]):
-            r = f.result(); results.append(r)
-            show(r, "  [%3d/%d] " % (len(results), STRESS_TOTAL))
-    wall = time.perf_counter() - t0
 
-    ok = [r for r in results if r["ok"]]
-    bad = [r for r in results if not r["ok"]]
+    all_results, cycle_rows = [], []
+    grand_t0 = time.perf_counter()
+    for cyc in range(1, STRESS_CYCLES + 1):
+        print("\n--- CYCLE %d/%d ---" % (cyc, STRESS_CYCLES))
+        tasks = [(ENDPOINTS[i % len(ENDPOINTS)], images[i % len(images)],
+                  "c%ds%d" % (cyc, i + 1))
+                 for i in range(STRESS_TOTAL)]
+        results, t0 = [], time.perf_counter()
+        with ThreadPoolExecutor(max_workers=STRESS_CONC) as ex:
+            for f in as_completed([ex.submit(call, e, p, lb) for e, p, lb in tasks]):
+                r = f.result(); results.append(r)
+                show(r, "  [c%d %3d/%d] " % (cyc, len(results), STRESS_TOTAL))
+        wall = time.perf_counter() - t0
+
+        ok = [r for r in results if r["ok"]]
+        bad = [r for r in results if not r["ok"]]
+        walls = [r["wall"] for r in ok]
+        print("  CYCLE %d: ok %d  fail %d  wall %.1fs  %.2f pages/s  p50 %.1fs  p95 %.1fs"
+              % (cyc, len(ok), len(bad), wall,
+                 (len(ok) / wall) if wall else 0.0,
+                 pct(walls, 50) or 0.0, pct(walls, 95) or 0.0))
+        empties = [r for r in bad if not r["error"]]
+        if empties:
+            diagnose_empty(len(empties), STRESS_CONC)
+        for r in bad[:8]:
+            print("    FAIL %s %s: %s" % (r["label"], r["img"], r["error"] or "EMPTY markdown"))
+        cycle_rows.append((cyc, len(ok), len(bad), wall, (len(ok) / wall) if wall else 0.0))
+        all_results.extend(results)
+
+    grand_wall = time.perf_counter() - grand_t0
+    ok = [r for r in all_results if r["ok"]]
+    bad = [r for r in all_results if not r["ok"]]
     walls = [r["wall"] for r in ok]
-    print("\n=== STRESS SUMMARY ===")
-    print("  calls %d   ok %d   FAIL/EMPTY %d" % (STRESS_TOTAL, len(ok), len(bad)))
-    print("  burst wall %.1fs   throughput %.2f pages/s (%.0f pages/min)"
-          % (wall, len(ok) / wall, len(ok) / wall * 60))
+    print("\n=== STRESS SUMMARY (all cycles) ===")
+    print("  %-6s %6s %6s %9s %10s" % ("cycle", "ok", "fail", "wall", "pages/s"))
+    for cyc, nok, nbad, wall, thr in cycle_rows:
+        print("  %-6d %6d %6d %8.1fs %10.2f" % (cyc, nok, nbad, wall, thr))
+    print("  TOTAL  calls %d   ok %d   FAIL/EMPTY %d   wall %.1fs   %.2f pages/s (%.0f pages/min)"
+          % (len(all_results), len(ok), len(bad), grand_wall,
+             len(ok) / grand_wall, len(ok) / grand_wall * 60))
     if walls:
         print("  latency p50 %.1fs   p95 %.1fs   max %.1fs   mean %.1fs"
               % (pct(walls, 50), pct(walls, 95), max(walls), statistics.mean(walls)))
-    empties = [r for r in bad if not r["error"]]
-    if empties:
-        diagnose_empty(len(empties), STRESS_CONC)
-    for r in bad[:8]:
-        print("    FAIL %s %s: %s" % (r["label"], r["img"], r["error"] or "EMPTY markdown"))
 
     out = os.path.join(HERE, "runpod_stress_results.json")
     with open(out, "w", encoding="utf-8") as f:
-        json.dump([{k: v for k, v in r.items() if k != "_body"} for r in results],
+        json.dump([{k: v for k, v in r.items() if k != "_body"} for r in all_results],
                   f, indent=2, ensure_ascii=False)
     print("  saved -> %s" % out)
-    return results
+    return all_results
 
 
 # ------------------------------------------------------------------ coldstart / FlashBoot
