@@ -108,6 +108,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SERVERLESS = bool(ENDPOINT_ID)
 RP = "https://api.runpod.ai/v2"
 
+# ONE shared session with a big keep-alive pool. Without it, every submit and every
+# 2s poll across 320 threads opened and closed its own TCP connection; by cycle 5 of
+# a soak run Windows had ~16k ports stuck in TIME_WAIT and new connections started
+# dying with "Max retries exceeded ... NewConnectionError" - a CLIENT-side failure
+# that looks like the endpoint's fault. Keep-alive reuse cuts the churn to almost
+# nothing. (Same lesson for the C# side: one shared HttpClient, never per-call.)
+_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=8,
+                                         pool_maxsize=STRESS_CONC + 32)
+_SESSION = requests.Session()
+_SESSION.mount("https://", _ADAPTER)
+_SESSION.mount("http://", _ADAPTER)
+
 
 # ------------------------------------------------------------------ helpers
 def png_size(path):
@@ -142,7 +154,7 @@ def pct(vals, p):
 
 # ------------------------------------------------------------------ transports
 def _call_direct(endpoint, uri):
-    r = requests.post(endpoint.rstrip("/") + "/glmocr/parse",
+    r = _SESSION.post(endpoint.rstrip("/") + "/glmocr/parse",
                       json={"images": [uri]}, timeout=TIMEOUT)
     if r.status_code != 200:
         return None, "HTTP %d: %s" % (r.status_code, r.text[:160]), {}
@@ -153,8 +165,21 @@ def _call_serverless(_endpoint, uri):
     """POST /run then poll /status. /runsync is unusable: its result window is 1 min
     (5 max) and a cold boot is 6-7 min."""
     hdr = {"Authorization": "Bearer " + API_KEY, "Content-Type": "application/json"}
-    r = requests.post("%s/%s/run" % (RP, ENDPOINT_ID), headers=hdr,
-                      json={"input": {"image": uri}}, timeout=120)
+
+    # Submit with retry. A submit that died on TRANSPORT never created a job, so
+    # retrying cannot duplicate work. (An HTTP error answer is not retried - that is
+    # the server actually speaking, e.g. a real 429.)
+    last = None
+    for i in range(3):
+        try:
+            r = _SESSION.post("%s/%s/run" % (RP, ENDPOINT_ID), headers=hdr,
+                              json={"input": {"image": uri}}, timeout=120)
+            break
+        except requests.exceptions.RequestException as ex:
+            last = ex
+            time.sleep(2.0 * (i + 1))
+    else:
+        return None, "submit transport failed after 3 tries: %s" % str(last)[:140], {}
     if r.status_code != 200:
         return None, "submit HTTP %d: %s" % (r.status_code, r.text[:160]), {}
     job = r.json()
@@ -163,8 +188,21 @@ def _call_serverless(_endpoint, uri):
         return None, "no job id: %s" % str(job)[:160], {}
 
     deadline = time.time() + TIMEOUT
+    net_fails = 0
     while time.time() < deadline:
-        g = requests.get("%s/%s/status/%s" % (RP, ENDPOINT_ID, jid), headers=hdr, timeout=60)
+        # Poll failures are tolerated, not fatal: the JOB is fine on RunPod's side,
+        # only our status peek failed. Aborting here would discard a job that is
+        # still running and likely completing.
+        try:
+            g = _SESSION.get("%s/%s/status/%s" % (RP, ENDPOINT_ID, jid),
+                             headers=hdr, timeout=60)
+        except requests.exceptions.RequestException as ex:
+            net_fails += 1
+            if net_fails > 15:
+                return None, "status polling died %d times: %s" % (net_fails, str(ex)[:120]), {}
+            time.sleep(POLL_S)
+            continue
+        net_fails = 0
         if g.status_code != 200:
             return None, "status HTTP %d: %s" % (g.status_code, g.text[:160]), {}
         job = g.json()
