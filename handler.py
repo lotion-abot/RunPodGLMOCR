@@ -80,6 +80,26 @@ def _oom_since(offset):
         return False        # can't read the log -> never CLAIM an OOM we didn't see
 
 
+def _recognition_failures_since(offset):
+    """Region-level VLM failures since `offset`. glmocr's recognition worker logs
+    'Recognition failed for page N: <reason>' and sets that region's content=None;
+    the result formatter then SILENTLY DROPS the region from md_results AND
+    layout_details ('Skip empty or failed content'). Proven on file 5729 page 26
+    (2026-08-19): layout found the PPE table at score 0.935, its transcription
+    failed, and the page came back as ONE title block — indistinguishable from a
+    sparse page. Every such job must FAIL so the C# page-failure path reruns it;
+    a silently missing table is exactly the class of error nobody can verify."""
+    try:
+        with open(GLMOCR_LOG, "rb") as f:
+            f.seek(offset)
+            tail = f.read()
+        lines = [ln.decode("utf-8", "replace") for ln in tail.splitlines()
+                 if b"Recognition failed" in ln]
+        return lines
+    except OSError:
+        return []
+
+
 def _vllm_alive():
     """Is the OCR brain still there? Measured 2026-08-12: EngineCore died on a CUDA
     device-side assert, the vLLM process exited, and glmocr kept answering HTTP 200
@@ -263,6 +283,25 @@ async def handler(job):
                         "refresh_worker": True,
                     }
                 out = _adapt(body, width, height)
+
+                # Region-level VLM failure = a region layout DID detect vanished
+                # silently from the output. Never return such a page as success —
+                # retry once (transient 5xx/timeout), then fail the job loudly.
+                rec_fails = _recognition_failures_since(mark)
+                if rec_fails:
+                    if attempt == 1:
+                        log.warning("recognition failure(s) in glmocr log — regions were "
+                                    "silently dropped; retrying the page once: %s",
+                                    "; ".join(rec_fails[:3]))
+                        await asyncio.sleep(1.5)
+                        continue
+                    log.error("recognition failure(s) persisted on retry — failing the "
+                              "job: %s", "; ".join(rec_fails[:3]))
+                    return {
+                        "error": ("region transcription failed and glmocr silently dropped "
+                                  "the region(s) (page came back incomplete): %s"
+                                  % "; ".join(rec_fails[:3])),
+                    }
 
                 if out["md_results"].strip():
                     return out

@@ -50,11 +50,21 @@ from huggingface_hub import snapshot_download; \
 # runner.py deep-merges our overrides onto the glmocr PACKAGE default config. Skipping
 # that merge loses label_task_mapping, every native_label degrades to 'text', and the
 # C# title detection / dedup / header recovery all go blind - silently.
+#
+# page_loader.max_pixels (2026-08-19, file 5729 page 26): glmocr's default (71,372,800)
+# sends big region crops near-native; vLLM then resizes to the model's 78x78=6084-token
+# grid and the aspect rounding can land ABOVE it ("image item with length 6090 exceeds
+# the pre-allocated encoder cache size 6084" -> HTTP 400 -> glmocr set content=None and
+# the result formatter SILENTLY DROPPED the region: the page shipped without its table).
+# smart_resize enforces t*h*w <= max_pixels with t=2, so 9,408,000 = 2*784*6000 targets
+# <= 6000 tokens per crop (worst measured 5984; margin 100 vs the 6084 cache).
 COPY runner.py /app/runner.py
 RUN printf '%s\n' \
       'pipeline:' \
       '  maas:' \
       '    enabled: false' \
+      '  page_loader:' \
+      '    max_pixels: 9408000' \
       '  layout:' \
       '    model_dir: PaddlePaddle/PP-DocLayoutV3_safetensors' \
       '  ocr_api:' \
